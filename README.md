@@ -1,43 +1,113 @@
-# Smart Contract Audit — Démo
+# Smart Contract Audit Demo
 
-Démo d'**audit de sécurité de smart contracts** : un contrat volontairement vulnérable, sa version corrigée, et les tests qui prouvent la différence. Objectif : illustrer la détection et la remédiation de vulnérabilités Solidity courantes avec **Slither** (analyse statique) et **Foundry** (tests/PoC en environnement local).
+> A small, self-contained security audit: a deliberately vulnerable Solidity vault, its fixed version, and Foundry tests that exploit the first and show the second holds its funds.
 
-> 🧪 **Contrats d'exemple uniquement.** Aucun contrat réel, aucune cible mainnet, aucune donnée sensible. Les vulnérabilités sont volontaires et à but pédagogique.
+![Solidity](https://img.shields.io/badge/Solidity-0.8.20-363636?style=flat-square&logo=solidity&logoColor=white)
+![Foundry](https://img.shields.io/badge/Foundry-forge-e84142?style=flat-square)
+![Slither](https://img.shields.io/badge/Slither-static%20analysis-6ea8ff?style=flat-square)
+![Purpose](https://img.shields.io/badge/purpose-educational-38f0c0?style=flat-square)
 
-## 🔍 Vulnérabilités illustrées
+> **🧪 Educational example only.** Written from scratch for this repository. No real contract, no mainnet target, no sensitive data. The vulnerabilities are intentional and the exploit contract only runs inside a local Foundry test.
 
-| # | Vulnérabilité | Contrat vulnérable | Correctif |
-|---|---|---|---|
-| 1 | **Reentrancy** (appel externe avant mise à jour d'état) | `VulnerableVault.withdraw` | checks-effects-interactions + verrou `nonReentrant` |
-| 2 | **Autorisation via `tx.origin`** | `VulnerableVault.emergencyWithdraw` | utiliser `msg.sender` |
+---
 
-## 🗂️ Structure
+## Table of contents
 
+- [What this demonstrates](#what-this-demonstrates)
+- [Findings](#findings)
+- [How the reentrancy exploit works](#how-the-reentrancy-exploit-works)
+- [The fix](#the-fix)
+- [Reproduce the audit](#reproduce-the-audit)
+- [Project structure](#project-structure)
+- [Limits of this demo](#limits-of-this-demo)
+- [Tech stack](#tech-stack)
+
+## What this demonstrates
+
+A typical audit workflow in miniature: read the code, run static analysis, write a proof of concept that confirms the issue, apply a fix, and keep a test that guards against regression.
+
+## Findings
+
+| # | Vulnerability | Where | Severity | Fix |
+|---|---|---|---|---|
+| 1 | **Reentrancy** — the external call happens before the balance is updated | `VulnerableVault.withdraw` | High | Checks-effects-interactions ordering plus a `nonReentrant` lock |
+| 2 | **Authorisation through `tx.origin`** — a malicious contract can relay a call made by the owner | `VulnerableVault.emergencyWithdraw` | Medium | Check `msg.sender` instead of `tx.origin` |
+
+## How the reentrancy exploit works
+
+`VulnerableVault.withdraw` sends the funds with a low-level call **before** it decrements the sender's balance:
+
+```solidity
+function withdraw(uint256 amount) external {
+    require(balances[msg.sender] >= amount, "solde insuffisant");
+    (bool ok, ) = msg.sender.call{value: amount}("");   // external call first
+    require(ok, "transfert echoue");
+    balances[msg.sender] -= amount;                      // state update too late
+}
 ```
-src/VulnerableVault.sol   # vulnérable (démo)
-src/FixedVault.sol        # corrigé
-test/Audit.t.sol          # tests Foundry : exploit sur le vulnérable, résistance du corrigé
-foundry.toml
+
+The `Attacker` contract in `test/Audit.t.sol` deposits 1 ether, withdraws it, and re-enters `withdraw` from its `receive()` function while the vault still believes the balance is untouched. The vault is drained beyond the attacker's legitimate deposit, which the test asserts.
+
+## The fix
+
+`FixedVault` applies three changes:
+
+```solidity
+function withdraw(uint256 amount) external nonReentrant {   // 1. reentrancy lock
+    if (balances[msg.sender] < amount) revert InsufficientBalance();
+    balances[msg.sender] -= amount;                           // 2. effects before interactions
+    (bool ok, ) = msg.sender.call{value: amount}("");
+    if (!ok) revert TransferFailed();
+}
+
+function emergencyWithdraw() external {
+    if (msg.sender != owner) revert NotOwner();               // 3. msg.sender, not tx.origin
+    payable(owner).transfer(address(this).balance);
+}
 ```
 
-## 🚀 Reproduire l'audit
+It also uses custom errors and an `immutable` owner.
 
-**Analyse statique (Slither)**
+## Reproduce the audit
+
+**Static analysis (Slither)**
+
 ```bash
 pip install slither-analyzer
 slither src/VulnerableVault.sol
 ```
 
-**Tests / PoC (Foundry)**
+**Tests and proof of concept (Foundry)**
+
 ```bash
 forge install foundry-rs/forge-std
 forge test -vvv
 ```
 
-## 🛠️ Stack
+| Test | What it checks |
+|---|---|
+| `testReentrancyDrainsVulnerableVault` | The attacker contract drains the vulnerable vault below the legitimate 5 ether deposit |
+| `testFixedVaultKeepsFunds` | The fixed vault keeps deposited funds intact |
 
-Solidity 0.8.20 · Slither · Foundry (forge)
+## Project structure
 
-## 👤 Auteur
+```text
+src/VulnerableVault.sol   Intentionally vulnerable contract (demo)
+src/FixedVault.sol        Corrected contract
+test/Audit.t.sol          Foundry tests, including the Attacker contract
+foundry.toml              Compiler 0.8.20, optimizer enabled (200 runs)
+```
 
-Konaté Adama (**[@DaskoStudio](https://github.com/DaskoStudio)**) — orienté cybersécurité, Ynov Campus
+## Limits of this demo
+
+- The reentrancy exploit has a dedicated test; the `tx.origin` issue is shown in the source and flagged by static analysis, but has no exploit test.
+- The second test checks fund integrity of the fixed vault; a natural extension is to run the same `Attacker` against `FixedVault` and assert that the attack reverts.
+- This is a teaching example, not a complete audit methodology (no fuzzing, invariants or formal verification).
+
+## Tech stack
+
+Solidity 0.8.20 · Foundry (forge, forge-std) · Slither
+
+---
+
+**Author** — Konaté Adama · [github.com/DaskoStudio](https://github.com/DaskoStudio)
